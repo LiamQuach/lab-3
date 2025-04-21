@@ -1,0 +1,1062 @@
+---
+title: "Global Vaccination & Science Attitudes"
+format: 
+  dashboard:
+    theme: cosmo
+    orientation: columns
+    nav-tabs: true
+    nav-buttons: 
+      - icon: github
+        href: https://github.com/LiamQuach/
+        aria-label: GitHub
+      - icon: linkedin
+        href: https://www.linkedin.com/in/liam-quach-36a52a197/
+        aria-label: LinkedIn
+      - icon: twitter
+        href: https://twitter.com/username/
+        aria-label: Twitter
+      - icon: instagram
+        href: https://instagram.com/username/
+        aria-label: Instagram
+      - icon: envelope
+        href: mailto:email@example.com
+        aria-label: Email
+logo: images/welcome_logo.jpg
+logo-alt: Welcome logo with big W
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# Setup: Load Libraries and Data
+library(tidyverse)
+library(readxl)
+library(leaflet)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(patchwork)
+library(plotly)
+library(htmltools)
+library(flexdashboard)
+
+# Create SVG logo (Olympic rings style) - Save this in images directory
+create_vax_logo <- function() {
+  if (!dir.exists("images")) {
+    dir.create("images")
+  }
+  
+  # Use R graphics to create an SVG file
+  svg("images/vax_logo.svg", width = 6, height = 3)
+  
+  # Set up the plot
+  par(mar = c(0,0,0,0))
+  plot(0, 0, type = "n", xlim = c(0, 6), ylim = c(0, 3), axes = FALSE, xlab = "", ylab = "")
+  
+  # Draw five interlocking circles (Olympic rings style)
+  symbols(c(1, 2.2, 3.4, 4.6, 5.8), c(1.5, 1.5, 1.5, 1.5, 1.5), 
+          circles = rep(0.8, 5), inches = FALSE, add = TRUE, 
+          fg = c("#3283C8", "#F1CF5B", "#53A842", "#E42526", "#28AAE1"), 
+          bg = NA, lwd = 10)
+  
+  # Add text labels inside each circle
+  text(c(1, 2.2, 3.4, 4.6, 5.8), c(1.5, 1.5, 1.5, 1.5, 1.5), 
+       labels = c("V", "A", "X", "S", "G"), 
+       col = "white", font = 2, cex = 1.2)
+  
+  dev.off()
+}
+
+# Try to create the logo (only if it doesn't exist)
+if (!file.exists("images/vax_logo.svg")) {
+  tryCatch({
+    create_vax_logo()
+  }, error = function(e) {
+    warning("Could not create logo: ", e$message)
+  })
+}
+
+# Read in the Wellcome data
+full_df <- read_excel("~/Documents/STAT 541/wgm2018-dataset-crosstabs-all-countries.xlsx", sheet = 'Full dataset')
+data_dict <- read_excel("~/Documents/STAT 541/wgm2018-dataset-crosstabs-all-countries.xlsx", sheet = 'Data dictionary')
+
+# --- 1. Common Processing: Create Mappings ---
+
+# Define a robust function to parse mappings from the data dictionary
+parse_mapping <- function(mapping_raw) {
+  # Check if mapping_raw is NA or empty
+  if (is.na(mapping_raw) || nchar(trimws(mapping_raw)) == 0) {
+    warning("Received empty or NA mapping string.")
+    return(tibble(code = integer(), name = character()))
+  }
+
+  # Split by comma, potentially handling extra spaces
+  mapping_list <- strsplit(mapping_raw, ",")[[1]]
+  # Keep only elements containing '=', trim whitespace
+  mapping_list <- trimws(mapping_list[grepl("=", mapping_list)])
+
+  # Split each element by '='
+  split_list <- strsplit(mapping_list, "=", fixed = TRUE)
+
+  # Create a tibble, handling potential errors during conversion
+  mapping_df <- tryCatch({
+    tibble(
+      code_raw = sapply(split_list, `[`, 1),
+      name = sapply(split_list, `[`, 2)
+    ) %>%
+      # Attempt to convert code to integer, coercing errors to NA
+      mutate(code = suppressWarnings(as.integer(trimws(code_raw))),
+             name = trimws(name)) %>%
+      # Filter out rows where code conversion failed or name is missing
+      filter(!is.na(code), !is.na(name), name != "") %>%
+      select(code, name)
+  }, error = function(e) {
+    warning("Error parsing mapping: ", e$message)
+    return(tibble(code = integer(), name = character()))
+  })
+
+  return(mapping_df)
+}
+
+# Create Country Mapping Data Frame
+country_mapping_raw <- data_dict %>%
+  filter(`Variable Name` == "WP5") %>%
+  pull(`Variable Type & Codes*`)
+# Keep original mapping column names for joining ease, rename later if needed
+country_mapping_df <- parse_mapping(country_mapping_raw) # Columns: code, name
+
+# Create Region Mapping Data Frame
+region_mapping_raw <- data_dict %>%
+  filter(`Variable Name` == "Regions_Report") %>%
+  pull(`Variable Type & Codes*`)
+# Keep original mapping column names for joining ease
+region_mapping_df <- parse_mapping(region_mapping_raw) # Columns: code, name
+
+
+# --- 2. Analysis 1: Vaccine Safety Perception (Q25) ---
+
+vaccine_safety_summary <- full_df %>%
+  # Select necessary columns including the weight 'wgt'
+  select(WP5, Regions_Report, wgt, Q25) %>%
+  # Filter out missing or "Don't know" responses for Q25
+  filter(!is.na(Q25) & Q25 != 99) %>%
+  # Create binary indicator: 1 if they agree/strongly agree vaccines are safe
+  mutate(vaccine_safe = ifelse(Q25 %in% c(1, 2), 1, 0)) %>%
+  # Join with mapping tables *before* summarizing
+  # Use suffixes to handle duplicated 'name' columns from mappings
+  left_join(country_mapping_df, by = c("WP5" = "code"), suffix = c("", ".country")) %>%
+  left_join(region_mapping_df, by = c("Regions_Report" = "code"), suffix = c(".country", ".region")) %>%
+  # Filter out rows where mapping might have failed (optional but good practice)
+  filter(!is.na(name.country), !is.na(name.region)) %>%
+  # Group by the mapped names (which are now name.country and name.region)
+  group_by(name.country, name.region) %>%
+  # Calculate the weighted percentage, name it as in the original final df
+  summarize(
+    `% Believe Vaccines Safe` = sum(vaccine_safe * wgt, na.rm = TRUE) / sum(wgt, na.rm = TRUE) * 100,
+    .groups = 'drop' # Drop grouping structure after summarizing
+  ) %>%
+  # Rename the grouped columns to match the original 'final_df' names
+  rename(
+      Country = name.country,
+      Region = name.region
+  ) %>%
+  # Select only the final desired columns in the desired order
+  select(Country, Region, `% Believe Vaccines Safe`)
+
+# --- 3. Analysis 2: Child Vaccination Status (Q28) ---
+
+vaccination_status_summary <- full_df %>%
+  # Select necessary columns (Weight 'wgt' wasn't used in original code for this part)
+  select(WP5, Q28) %>%
+  # Keep only valid responses (1 = vaccinated, 2 = not vaccinated)
+  filter(Q28 %in% c(1, 2)) %>%
+  # Join with country mapping *before* summarizing
+  left_join(country_mapping_df, by = c("WP5" = "code")) %>% # Adds 'name' column for country
+  # Filter out rows where country mapping failed
+  filter(!is.na(name)) %>%
+  # Create binary indicator for vaccinated status
+  mutate(Vaccinated = if_else(Q28 == 1, 1, 0)) %>%
+  # Group by the mapped Country name (column 'name')
+  group_by(name) %>%
+  # Summarize counts and calculate proportion (unweighted as per original code)
+  # Names generated here match the original 'country_summary'
+  summarize(
+    N_Respondents = n(),
+    N_Vaccinated = sum(Vaccinated),
+    Proportion_Vaccinated = N_Vaccinated / N_Respondents,
+    .groups = "drop"
+  ) %>%
+  # Rename the 'name' column to 'Country' to match original variable name
+  rename(Country = name) %>%
+  # Apply specific country name adjustments as in the original code
+  mutate(Country = case_when(
+    Country == "Bosnia and Herzegovina" ~ "Bosnia and Herzegovina", # No change needed, but included for completeness
+    Country == "Czech Republic" ~ "Czechia",
+    Country == "Dominican Republic" ~ "Dominican Republic", # No change
+    Country == "Eswatini" ~ "Eswatini", # No change
+    Country == "Ivory Coast" ~ "Côte d'Ivoire",
+    Country == "Macedonia" ~ "North Macedonia",
+    Country == "Northern Cyprus" ~ "Cyprus", # Note: Original comment maintained
+    Country == "Palestinian Territories" ~ "Palestine",
+    Country == "Republic of Congo" ~ "Republic of the Congo",
+    Country == "The Gambia" ~ "Gambia",
+    Country == "United States" ~ "United States of America",
+    TRUE ~ Country # Keep all other names as they are
+  ))
+
+
+# --- 4. Analysis 3: View of Science (ViewOfScience) ---
+
+science_view_summary <- full_df %>%
+  # Select necessary columns (Weight 'wgt' wasn't used in original code)
+  select(WP5, ViewOfScience) %>%
+  # Keep only valid responses (assuming 1-4 are valid categories)
+  filter(ViewOfScience %in% c(1, 2, 3, 4)) %>%
+  # Join with country mapping *before* summarizing
+  left_join(country_mapping_df, by = c("WP5" = "code")) %>% # Adds 'name' column for country
+  # Filter out rows where country mapping failed
+  filter(!is.na(name)) %>%
+  # Create readable labels for the science view categories
+  mutate(
+    ViewOfScience_Label = case_when(
+      ViewOfScience == 1 ~ "Enthusiast",
+      ViewOfScience == 2 ~ "Included",
+      ViewOfScience == 3 ~ "Excluded",
+      ViewOfScience == 4 ~ "Sceptic",
+      TRUE ~ NA_character_ # Should not happen due to filter, but safe practice
+    )
+  ) %>%
+  # Filter out any rows where label creation failed (optional)
+  filter(!is.na(ViewOfScience_Label)) %>%
+  # Group by Country (column 'name') and the created label
+  group_by(name, ViewOfScience_Label) %>%
+  # Count occurrences for each group (unweighted as per original code)
+  # Name 'N' matches original
+  summarize(N = n(), .groups = "drop") %>%
+   # Rename the country name column *before* the next grouping
+  rename(Country = name) %>%
+  # Group again just by Country to calculate proportions within each country
+  group_by(Country) %>%
+  # Calculate the proportion of each view within the country
+  # Name 'Proportion' matches original
+  mutate(Proportion = N / sum(N)) %>%
+  # Ungroup for a clean final tibble
+  ungroup()
+
+# Add broader region mapping for better visualization
+region_mapping <- c(
+  "Northern America" = "Americas",
+  "South America" = "Americas",
+  "Central America and Mexico" = "Americas",
+  "Northern Europe" = "Europe",
+  "Western Europe" = "Europe",
+  "Southern Europe" = "Europe",
+  "Eastern Europe" = "Europe",
+  "North Africa" = "Middle East & North Africa",
+  "Middle East" = "Middle East & North Africa",
+  "South Asia" = "Asia",
+  "Southeast Asia" = "Asia",
+  "East Asia" = "Asia",
+  "Western Africa" = "Sub-Saharan Africa",
+  "Eastern Africa" = "Sub-Saharan Africa",
+  "Southern Africa" = "Sub-Saharan Africa",
+  "Central Africa" = "Sub-Saharan Africa",
+  "Aus/NZ" = "Oceania",
+  "Central Asia" = "Former Soviet Union",
+  "Not assigned" = "Other"
+)
+
+# Add broader region to the dataset
+vaccine_safety_summary <- vaccine_safety_summary %>%
+  mutate(BroadRegion = region_mapping[Region])
+
+# Calculate global statistics for the info cards
+# 1. Function to create summary cards
+create_summary_stats <- function() {
+  # Calculate global statistics
+  global_vax_belief <- mean(vaccine_safety_summary$`% Believe Vaccines Safe`, na.rm = TRUE)
+  
+  global_vax_coverage <- weighted.mean(
+    vaccination_status_summary$Proportion_Vaccinated,
+    vaccination_status_summary$N_Respondents,
+    na.rm = TRUE
+  ) * 100
+  
+  # Count countries with high/low vaccine confidence
+  high_confidence_count <- sum(vaccine_safety_summary$`% Believe Vaccines Safe` > 90, na.rm = TRUE)
+  low_confidence_count <- sum(vaccine_safety_summary$`% Believe Vaccines Safe` < 50, na.rm = TRUE)
+  
+  # Calculate global science perception stats
+  science_global <- science_view_summary %>%
+    group_by(ViewOfScience_Label) %>%
+    summarize(
+      total_n = sum(N),
+      proportion = sum(N) / sum(science_view_summary$N),
+      .groups = "drop"
+    )
+  
+  # Return the values
+  return(list(
+    global_vax_belief = global_vax_belief,
+    global_vax_coverage = global_vax_coverage,
+    high_confidence_count = high_confidence_count,
+    low_confidence_count = low_confidence_count,
+    total_countries = nrow(vaccine_safety_summary),
+    science_global = science_global
+  ))
+}
+
+# Get stats for cards
+card_stats <- create_summary_stats()
+
+# 2. Function to create regional comparison plot for vaccine attitudes
+create_regional_breakdown <- function() {
+  # Group by region and calculate statistics
+  region_breakdown <- vaccine_safety_summary %>%
+    group_by(BroadRegion) %>%
+    summarize(
+      mean_belief = mean(`% Believe Vaccines Safe`, na.rm = TRUE),
+      min_belief = min(`% Believe Vaccines Safe`, na.rm = TRUE),
+      max_belief = max(`% Believe Vaccines Safe`, na.rm = TRUE),
+      range_belief = max_belief - min_belief,
+      count = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(mean_belief))
+  
+  # Create the plot
+  p <- ggplot(region_breakdown, aes(x = reorder(BroadRegion, mean_belief), y = mean_belief)) +
+    geom_bar(stat = "identity", fill = "#3498DB", alpha = 0.7) +
+    geom_errorbar(aes(ymin = min_belief, ymax = max_belief), width = 0.2, color = "#E74C3C") +
+    geom_text(aes(label = sprintf("%.1f%%", mean_belief)), hjust = -0.1) +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+      title = "Vaccine Safety Belief by Region",
+      subtitle = "Average percentage with range (min-max)",
+      x = NULL,
+      y = "% Believe Vaccines are Safe"
+    ) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+  
+  return(p)
+}
+
+# 3. Function to create top/bottom countries visualization
+create_topbottom_countries <- function() {
+  # Get top and bottom 10 countries
+  top10 <- vaccine_safety_summary %>%
+    arrange(desc(`% Believe Vaccines Safe`)) %>%
+    head(10)
+  
+  bottom10 <- vaccine_safety_summary %>%
+    arrange(`% Believe Vaccines Safe`) %>%
+    head(10)
+  
+  # Combine and add rank factor
+  combined <- bind_rows(
+    top10 %>% mutate(group = "Highest 10"),
+    bottom10 %>% mutate(group = "Lowest 10")
+  ) %>%
+    group_by(group) %>%
+    mutate(rank = row_number()) %>%
+    ungroup()
+  
+  # Create the plot
+  p <- ggplot(combined, aes(x = reorder(Country, `% Believe Vaccines Safe`), 
+                          y = `% Believe Vaccines Safe`,
+                          fill = group)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = sprintf("%.1f%%", `% Believe Vaccines Safe`)), 
+            hjust = -0.1, size = 3) +
+    facet_wrap(~group, scales = "free_y") +
+    coord_flip() +
+    scale_fill_manual(values = c("Highest 10" = "#27AE60", "Lowest 10" = "#E74C3C")) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(face = "bold"),
+      strip.text = element_text(face = "bold", size = 10),
+      panel.grid.minor = element_blank()
+    ) +
+    labs(
+      title = "Countries with Highest and Lowest Vaccine Confidence",
+      x = NULL,
+      y = "% Believe Vaccines are Safe"
+    )
+  
+  return(p)
+}
+
+# 4. Function to create regional science perception comparison
+create_region_science_comparison <- function() {
+  # Join science view data with regions
+  science_by_region <- science_view_summary %>%
+    left_join(select(vaccine_safety_summary, Country, BroadRegion), by = "Country") %>%
+    filter(!is.na(BroadRegion))
+  
+  # Group by region and ViewOfScience
+  region_science <- science_by_region %>%
+    group_by(BroadRegion, ViewOfScience_Label) %>%
+    summarize(
+      Total_N = sum(N),
+      Weighted_Proportion = sum(N * Proportion) / sum(N),
+      .groups = "drop"
+    ) %>%
+    # Add category colors
+    mutate(
+      color = case_when(
+        ViewOfScience_Label == "Enthusiast" ~ "#FFD166",
+        ViewOfScience_Label == "Included" ~ "#06D6A0", 
+        ViewOfScience_Label == "Excluded" ~ "#73D2DE",
+        ViewOfScience_Label == "Sceptic" ~ "#FFC5D3",
+        TRUE ~ "#CCCCCC"
+      )
+    )
+  
+  # Create plot
+  p <- ggplot(region_science, 
+            aes(x = BroadRegion, y = Weighted_Proportion, 
+                fill = ViewOfScience_Label)) +
+    geom_bar(stat = "identity", position = "stack") +
+    coord_flip() +
+    scale_fill_manual(values = c(
+      "Enthusiast" = "#FFD166", 
+      "Included" = "#06D6A0", 
+      "Excluded" = "#73D2DE", 
+      "Sceptic" = "#FFC5D3"
+    )) +
+    scale_y_continuous(labels = scales::percent) +
+    theme_minimal() +
+    theme(
+      legend.title = element_blank(),
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    ) +
+    labs(
+      title = "Science Perception Categories by Region",
+      x = NULL,
+      y = "Proportion"
+    )
+  
+  return(p)
+}
+
+# 5. Function to create correlation analysis between vaccine safety and science views
+create_correlation_plot <- function() {
+  # Prepare data
+  # Calculate proportion of enthusiasts by country
+  enthusiast_by_country <- science_view_summary %>%
+    filter(ViewOfScience_Label == "Enthusiast") %>%
+    select(Country, Proportion) %>%
+    rename(Enthusiast_Proportion = Proportion)
+  
+  # Join with vaccine safety data
+  correlation_data <- vaccine_safety_summary %>%
+    left_join(enthusiast_by_country, by = "Country") %>%
+    filter(!is.na(Enthusiast_Proportion))
+  
+  # Calculate correlation
+  corr_value <- cor(correlation_data$`% Believe Vaccines Safe`, 
+                  correlation_data$Enthusiast_Proportion,
+                  use = "complete.obs")
+  
+  # Create scatter plot
+  p <- ggplot(correlation_data, 
+            aes(x = `% Believe Vaccines Safe`, 
+                y = Enthusiast_Proportion * 100,
+                color = BroadRegion)) +
+    geom_point(size = 3, alpha = 0.7) +
+    geom_smooth(method = "lm", color = "black", se = TRUE, alpha = 0.2) +
+    scale_color_brewer(palette = "Set1") +
+    theme_minimal() +
+    theme(
+      legend.title = element_blank(),
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    ) +
+    labs(
+      title = "Correlation between Vaccine Confidence and Science Enthusiasm",
+      subtitle = paste("Correlation coefficient:", round(corr_value, 2)),
+      x = "% Believe Vaccines are Safe",
+      y = "% Science Enthusiasts"
+    )
+  
+  return(p)
+}
+```
+
+# Vaccination Insights {orientation="columns" nav-tab="active"}
+
+## Column {width=25%}
+
+### Global Vaccine Confidence{height=50%}
+
+::: {.valuebox icon="award" color="#3498db"}
+Global Average Belief in Vaccine Safety:
+
+`{r} paste0(round(card_stats$global_vax_belief, 1), "%")`
+:::
+
+### Vaccination Coverage{height=50%}
+
+::: {.valuebox icon="clipboard-check" color="#2ecc71"}
+Global Average Vaccination Rate:
+
+`{r} paste0(round(card_stats$global_vax_coverage, 1), "%")`
+:::
+
+## Column {.tabset width=75%}
+
+### Vaccine Safety Perception 
+
+```{r}
+#| label: new-and-improved-visualization
+#| fig-width: 10
+#| fig-height: 7
+#| fig-align: center
+
+# Calculate region medians
+region_stats <- vaccine_safety_summary %>%
+  group_by(BroadRegion) %>%
+  summarise(
+    median_value = median(`% Believe Vaccines Safe`),
+    count = n()
+  ) %>%
+  arrange(desc(median_value))
+
+# Get the order of regions by median value (descending)
+region_order <- region_stats$BroadRegion
+
+# Identify global extremes (top 5 and bottom 5)
+top5 <- vaccine_safety_summary %>%
+  arrange(desc(`% Believe Vaccines Safe`)) %>%
+  head(5)
+
+bottom5 <- vaccine_safety_summary %>%
+  arrange(`% Believe Vaccines Safe`) %>%
+  head(5)
+
+# Combine top and bottom into extremes
+extremes <- bind_rows(top5, bottom5)
+
+# Create a new dataset with highlight information
+vaccine_safety_summary <- vaccine_safety_summary %>%
+  mutate(
+    highlighted = Country %in% c(top5$Country, bottom5$Country),
+    point_size = ifelse(highlighted, 3, 1.5),
+    point_alpha = ifelse(highlighted, 1, 0.7)
+  )
+
+# Define region colors
+region_colors <- c(
+  "Asia" = "#D35400",
+  "Middle East & North Africa" = "#3498DB",
+  "Sub-Saharan Africa" = "#27AE60",
+  "Americas" = "#E67E22",
+  "Europe" = "#7F8C8D",
+  "Oceania" = "#16A085",
+  "Former Soviet Union" = "#8E44AD",
+  "Other" = "#95A5A6"
+)
+
+# Create the plot
+p <- ggplot() +
+  # Add horizontal lines for each region
+  geom_segment(
+    data = region_stats,
+    aes(
+      x = 30, 
+      xend = 100,
+      y = factor(BroadRegion, levels = region_order),
+      yend = factor(BroadRegion, levels = region_order),
+      color = BroadRegion
+    ),
+    alpha = 0.3,
+    size = 2
+  ) +
+  # Add points for each country
+  geom_point(
+    data = vaccine_safety_summary,
+    aes(
+      x = `% Believe Vaccines Safe`,
+      y = factor(BroadRegion, levels = region_order),
+      color = BroadRegion,
+      size = point_size,
+      alpha = point_alpha
+    )
+  ) +
+  # Add vertical lines for region medians
+  geom_segment(
+    data = region_stats,
+    aes(
+      x = median_value,
+      xend = median_value,
+      y = as.numeric(factor(BroadRegion, levels = region_order)) - 0.2,
+      yend = as.numeric(factor(BroadRegion, levels = region_order)) + 0.2,
+      color = BroadRegion
+    ),
+    size = 1.5
+  ) +
+  # Add median value labels
+  geom_text(
+    data = region_stats,
+    aes(
+      x = median_value,
+      y = factor(BroadRegion, levels = region_order),
+      color = BroadRegion,
+      label = paste0("Median: ", round(median_value, 1))
+    ),
+    vjust = -1.5,
+    size = 3.5
+  ) +
+  # Add country labels for extremes
+  geom_text(
+    data = extremes,
+    aes(
+      x = `% Believe Vaccines Safe`,
+      y = factor(BroadRegion, levels = region_order),
+      label = Country
+    ),
+    hjust = -0.2,
+    vjust = 1.2,
+    size = 3,
+    check_overlap = TRUE
+  ) +
+  # Set scale and appearance
+  scale_x_continuous(
+    limits = c(30, 100),
+    breaks = seq(30, 100, by = 10),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0.01, 0.1))
+  ) +
+  scale_color_manual(values = region_colors) +
+  scale_size_identity() +
+  scale_alpha_identity() +
+  # Customize theme
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    plot.caption = element_text(hjust = 0.5, size = 8),
+    axis.title.y = element_blank()
+  ) +
+  # Add labels
+  labs(
+    title = "Percentage of people who believe vaccines are safe",
+    subtitle = "By global region (2018)",
+    x = NULL,
+    caption = "Source: Wellcome Global Monitor, part of the Gallup World Poll 2018"
+  )
+
+# Add a text annotation for global extremes
+p <- p + 
+  annotate(
+    "text", 
+    x = 30, 
+    y = 0.55, 
+    label = "Global extremes are highlighted with larger points", 
+    hjust = 0, 
+    size = 3.2,
+    fontface = "italic"
+  )
+
+p
+```
+
+
+### Vaccination Status 
+
+
+```{r}
+#| label: second-improved-visualization
+#| fig-width: 10
+#| fig-height: 7
+
+# 1. Get world map shapefile
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# 2. Join the vaccination data to the world map
+world_vax <- world %>%
+  left_join(vaccination_status_summary, by = c("name" = "Country"))
+
+# 3. Create popup text
+world_vax <- world_vax %>%
+  mutate(
+    popup_text = paste0(
+      "<strong>Country: </strong>", name, "<br>",
+      "<strong>Percent Vaccinated: </strong>", 
+      ifelse(!is.na(Proportion_Vaccinated), scales::percent(Proportion_Vaccinated, accuracy = 0.1), "No data")
+    )
+  )
+
+# Create the color palette function explicitly
+# We define the domain so the palette function knows the range of values
+pal <- colorNumeric(
+  palette = "YlGnBu",
+  domain = world_vax$Proportion_Vaccinated,
+  na.color = "#CCCCCC"
+)
+
+# 4. Create Leaflet map - Single World, Zoomed In Slightly
+leaflet(data = world_vax) %>%
+  addProviderTiles(
+    providers$CartoDB.Positron,
+    options = providerTileOptions(noWrap = TRUE) # Add this option to prevent repeating world
+   ) %>%
+  setView(lng = 0, lat = 30, zoom = 2) %>% # Set initial center and zoom level
+  addPolygons(
+    fillColor = ~pal(Proportion_Vaccinated), # Use the pre-defined palette function
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    dashArray = "3",
+    fillOpacity = 0.7,
+    highlightOptions = highlightOptions(
+      weight = 3,
+      color = "#666",
+      dashArray = "",
+      fillOpacity = 0.7,
+      bringToFront = TRUE
+    ),
+    label = lapply(world_vax$popup_text, htmltools::HTML),
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "15px",
+      direction = "auto"
+    )
+  ) %>%
+  # Add the legend to the map
+  addLegend(
+    pal = pal,                       # Use the same palette function
+    values = ~Proportion_Vaccinated, # Use the data values the colors are based on
+    opacity = 0.7,                   # Match the fill opacity used in addPolygons
+    title = "Percent Vaccinated", # Set a title for the legend
+    position = "bottomright"         # Specify legend position
+  )
+```
+
+# Science Attitudes {orientation="columns"}
+
+## Column {width=25%}
+
+### Science Enthusiasts{height=33%}
+
+```{r}
+#| label: science-enthusiast-card
+
+# Calculate global percentage of enthusiasts
+enthusiast_pct <- card_stats$science_global %>%
+  filter(ViewOfScience_Label == "Enthusiast") %>%
+  pull(proportion) * 100
+```
+
+::: {.valuebox icon="book-fill" color="#f39c12"}
+Global Science Enthusiasts:
+
+`{r} paste0(round(enthusiast_pct, 1), "%")`
+:::
+
+### Science Skeptics{height=33%}
+
+```{r}
+#| label: science-skeptic-card
+
+# Calculate global percentage of skeptics
+skeptic_pct <- card_stats$science_global %>%
+  filter(ViewOfScience_Label == "Sceptic") %>%
+  pull(proportion) * 100
+```
+
+::: {.valuebox icon="question-circle" color="#e74c3c"}
+Global Science Skeptics:
+
+`{r} paste0(round(skeptic_pct, 1), "%")`
+:::
+
+### Correlation{height=33%}
+
+```{r}
+#| label: correlation-card
+
+# Calculate correlation between vaccine confidence and science enthusiasm
+enthusiast_by_country <- science_view_summary %>%
+  filter(ViewOfScience_Label == "Enthusiast") %>%
+  select(Country, Proportion) %>%
+  rename(Enthusiast_Proportion = Proportion)
+
+# Join with vaccine safety data
+correlation_data <- vaccine_safety_summary %>%
+  left_join(enthusiast_by_country, by = "Country") %>%
+  filter(!is.na(Enthusiast_Proportion))
+
+# Calculate correlation
+corr_value <- cor(correlation_data$`% Believe Vaccines Safe`, 
+                correlation_data$Enthusiast_Proportion,
+                use = "complete.obs")
+```
+
+::: {.valuebox icon="graph-up" color="#3498db"}
+Correlation: Vaccine Confidence & Science Enthusiasm
+
+`{r} round(corr_value, 2)`
+:::
+
+## Column {.tabset width=75%}
+
+### Science Perception Categories {.tabset}
+
+#### Global Overview
+
+```{r}
+#| label: third-improved-visualization
+#| fig-width: 10
+#| fig-height: 12
+#| fig-align: center
+
+# Load necessary libraries (already loaded in setup)
+# Calculate global averages for each category
+global_stats <- science_view_summary %>%
+  group_by(ViewOfScience_Label) %>%
+  summarize(
+    total_n = sum(N),
+    weighted_prop = sum(N * Proportion) / sum(N)
+  )
+
+# Define quadrant positions and characteristics for each category
+categories <- tibble(
+  ViewOfScience_Label = c("Enthusiast", "Included", "Excluded", "Sceptic"),
+  x_pos = c(0.75, 0.75, 0.25, 0.25), # x position in quadrant (right/left)
+  y_pos = c(0.25, 0.75, 0.25, 0.75), # y position in quadrant (top/bottom)
+  description = c(
+    "Believe science benefits both society and individuals",
+    "Believe science benefits individuals but not necessarily society",
+    "Believe science benefits society but not individuals in their lives",
+    "Don't see significant benefits from science at either level"
+  ),
+  color = c("#FFD166", "#06D6A0", "#73D2DE", "#FFC5D3"), # Gold, Green, Turquoise, Pink
+  label_text = c("Enthusiasts", "The Included", "The Excluded", "Sceptics")
+)
+
+# Join the category info with the global stats
+plot_data <- global_stats %>%
+  left_join(categories, by = "ViewOfScience_Label") %>%
+  mutate(percent_label = paste0(round(weighted_prop * 100, 1), "%"))
+
+# Total sample size
+total_sample <- sum(plot_data$total_n)
+
+# PLOT 1: Main Quadrant Visualization
+p1 <- ggplot() +
+  # Add quadrant dividing lines
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "gray50", size = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50", size = 1) +
+  
+  # Add bubbles for each category
+  geom_point(data = plot_data, 
+             aes(x = x_pos, y = y_pos, size = weighted_prop, fill = ViewOfScience_Label),
+             shape = 21, color = "white", alpha = 0.9) +
+  
+  # Add percentage labels inside bubbles
+  geom_text(data = plot_data,
+            aes(x = x_pos, y = y_pos, label = percent_label),
+            color = "white", fontface = "bold", size = 4) +
+  
+  # Add category names above/below bubbles
+  geom_text(data = plot_data,
+            aes(x = x_pos, y = y_pos, label = label_text),
+            vjust = -2.5, fontface = "bold", size = 3.5) +
+  
+  # Set scales
+  scale_size_continuous(range = c(20, 40)) +
+  scale_fill_manual(values = setNames(plot_data$color, plot_data$ViewOfScience_Label)) +
+  
+  # Set axis labels
+  labs(
+    x = "Perceived Benefits to Individuals",
+    y = "Perceived Benefits to Society"
+  ) +
+  
+  # Add axis direction indicators
+  annotate("text", x = c(0.1, 0.9), y = c(0.05, 0.05), 
+           label = c("Lower", "Higher"), size = 3.5) +
+  annotate("text", x = c(0.05, 0.05), y = c(0.1, 0.9), 
+           label = c("Lower", "Higher"), size = 3.5, angle = 90) +
+  
+  # Clean up the theme
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.margin = margin(20, 20, 20, 20)
+  ) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1))
+
+# PLOT 2: Category Explanations
+explanation_df <- tibble(
+  category = plot_data$label_text,
+  description = plot_data$description,
+  percentage = plot_data$percent_label,
+  color = plot_data$color
+)
+
+p2 <- ggplot(explanation_df, aes(y = 4:1)) +
+  geom_segment(aes(x = 0, xend = 0.9, yend = 4:1), color = "gray80") +
+  geom_point(aes(x = 0, fill = category), size = 5, shape = 21, color = "white") +
+  geom_text(aes(x = 0.1, label = paste0(category, " (", percentage, ")")), 
+            hjust = 0, fontface = "bold", size = 3.5) +
+  geom_text(aes(x = 0.1, label = description), 
+            hjust = 0, vjust = 1.8, size = 3) +
+  scale_fill_manual(values = setNames(explanation_df$color, explanation_df$category)) +
+  labs(title = "Understanding the Categories") +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 14, face = "bold", hjust = 0),
+    plot.margin = margin(10, 10, 10, 10)
+  ) +
+  coord_cartesian(xlim = c(-0.1, 4))
+
+# PLOT 3: Selected Countries Comparison
+# Select diverse countries to compare
+selected_countries <- c("United States", "China", "Germany", "India", "Brazil", "Nigeria")
+
+# Filter for selected countries
+country_data <- science_view_summary %>%
+  filter(Country %in% selected_countries) %>%
+  left_join(categories %>% select(ViewOfScience_Label, color, label_text), by = "ViewOfScience_Label") %>%
+  mutate(label_short = gsub("s$", "", label_text))  # Shorter labels for the chart
+
+p3 <- ggplot(country_data, aes(x = label_short, y = Proportion, fill = ViewOfScience_Label)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(label = paste0(round(Proportion * 100, 0), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", size = 2.8, fontface = "bold") +
+  facet_wrap(~Country, nrow = 2) +
+  scale_fill_manual(values = setNames(categories$color, categories$ViewOfScience_Label)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "Country Comparisons",
+    x = NULL,
+    y = "Percentage"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    strip.text = element_text(face = "bold", size = 10),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+  )
+
+# Combine plots using patchwork
+combined_plot <- (p1) / (p2 + p3) +
+  plot_layout(heights = c(1.2, 1)) +
+  plot_annotation(
+    title = "How People Feel About the Benefits of Science",
+    subtitle = "Combined view of perceived benefits at personal and societal levels",
+    caption = paste0("Global survey of 144 countries (n=", format(total_sample, big.mark=","), ")\n",
+                    "Note: ~15% of people did not answer one or both questions and were not included in the analysis."),
+    theme = theme(
+      plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 14, hjust = 0.5),
+      plot.caption = element_text(size = 10, hjust = 1)
+    )
+  )
+
+combined_plot
+```
+
+#### Regional Comparison
+
+```{r}
+#| label: region-science-comparison
+#| fig-width: 10
+#| fig-height: 7
+
+# Create regional science comparison
+create_region_science_comparison()
+```
+
+### Science & Vaccines {.tabset}
+
+#### Correlation Analysis
+
+```{r}
+#| label: science-vaccine-correlation
+#| fig-width: 10
+#| fig-height: 7
+
+# Create correlation plot
+create_correlation_plot()
+```
+
+#### Country Explorer {.no-title}
+
+```{r}
+#| label: country-explorer
+#| fig-width: 10
+#| fig-height: 7
+
+# Create an interactive scatterplot to explore countries
+# Join data
+explorer_data <- vaccine_safety_summary %>%
+  left_join(
+    science_view_summary %>% 
+      filter(ViewOfScience_Label == "Enthusiast") %>%
+      select(Country, Proportion) %>%
+      rename(Enthusiast_Proportion = Proportion),
+    by = "Country"
+  ) %>%
+  left_join(
+    science_view_summary %>% 
+      filter(ViewOfScience_Label == "Sceptic") %>%
+      select(Country, Proportion) %>%
+      rename(Skeptic_Proportion = Proportion),
+    by = "Country"
+  ) %>%
+  filter(!is.na(Enthusiast_Proportion), !is.na(Skeptic_Proportion)) %>%
+  mutate(
+    hover_text = paste0(
+      "Country: ", Country, "<br>",
+      "Region: ", BroadRegion, "<br>",
+      "Vaccine Safety Belief: ", round(`% Believe Vaccines Safe`, 1), "%<br>",
+      "Science Enthusiasts: ", round(Enthusiast_Proportion * 100, 1), "%<br>",
+      "Science Skeptics: ", round(Skeptic_Proportion * 100, 1), "%"
+    )
+  )
+
+# Create interactive plot with plotly
+plot_ly(
+  data = explorer_data,
+  x = ~`% Believe Vaccines Safe`,
+  y = ~(Enthusiast_Proportion * 100),
+  size = ~(Skeptic_Proportion * 100),
+  sizes = c(5, 30),
+  color = ~BroadRegion,
+  colors = "Set1",
+  text = ~hover_text,
+  hoverinfo = "text",
+  type = "scatter",
+  mode = "markers"
+) %>%
+  layout(
+    title = "Interactive Country Explorer: Vaccine Confidence vs. Science Attitudes",
+    xaxis = list(title = "% Believe Vaccines are Safe"),
+    yaxis = list(title = "% Science Enthusiasts"),
+    hovermode = "closest",
+    showlegend = FALSE
+  )
+```
